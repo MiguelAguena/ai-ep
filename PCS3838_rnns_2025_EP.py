@@ -456,11 +456,11 @@ def main(args):
 
     # --- Data Preparation ---
     file_path = pathlib.Path(args.data_filename)
-    split_date = datetime.datetime.fromisoformat(args.split_date)
+    split_date = datetime.datetime.fromisoformat(args.split_date) # Divide df de treinamento e df de teste a partir do dia 01/06/2020 (para o df de teste, é inclusivo)
     df = load_data(file_path=file_path)
-    feature_names = list(df.drop("datetime").columns)
+    feature_names = list(df.drop("datetime").columns) # Parece que só inclui o ssh...
 
-    train_df, test_df = split_data(df=df, split_date=split_date)
+    train_df, test_df = split_data(df=df, split_date=split_date) #
 
     # --- Apply scaling ---
     # Calculate mean and std from training data only
@@ -475,13 +475,13 @@ def main(args):
             (pl.col(f) - train_mean.select([f]).item()) / train_std.select([f]).item()
             for f in feature_names
         ]
-    )
+    ) # Normalização
     test_data_scaled = test_df.with_columns(
         [
             (pl.col(f) - train_mean.select([f]).item()) / train_std.select([f]).item()
             for f in feature_names
         ]
-    )
+    ) # Normalização
 
     # convert datetimes to minutes since first measurement
     train_data_scaled = train_data_scaled.with_columns(
@@ -491,7 +491,8 @@ def main(args):
             .cast(pl.Float32)
             .alias("datetime")
         ]
-    )
+    ) # Transformando em minutos
+
     test_data_scaled = test_data_scaled.with_columns(
         [
             (pl.col("datetime") - pl.col("datetime").min())
@@ -499,7 +500,7 @@ def main(args):
             .cast(pl.Float32)
             .alias("datetime")
         ]
-    )
+    ) # Transformando em minutos
 
     # Data removal to simulate missing data
     sample_train = sorted(
@@ -507,7 +508,9 @@ def main(args):
             range(train_data_scaled.height),
             int((1 - DATA_REMOVAL_RATIO) * train_data_scaled.height),
         )
-    )
+    ) # Remover parte dos dados de treinamento
+    # ALTERAR DATA_REMOVAL_RATIO DEPOIS
+
     train_data_scaled = train_data_scaled[sample_train]
 
     sample_test = sorted(
@@ -515,7 +518,9 @@ def main(args):
             range(test_data_scaled.height),
             int((1 - DATA_REMOVAL_RATIO) * test_data_scaled.height),
         )
-    )
+    ) # Remover parte dos dados de teste
+    # ALTERAR DATA_REMOVAL_RATIO DEPOIS
+
     test_data_scaled = test_data_scaled[sample_test]
 
     train_dataloader, test_dataloader = prepare_dataloaders(
@@ -528,8 +533,8 @@ def main(args):
     )
 
     # --- Model Setup ---
-    input_size = len(feature_names)
-    model = ARModel(input_size=input_size, hidden_size=args.hidden_size).to(device)
+    input_size = len(feature_names) # 1(?)
+    model = ARModel(input_size=input_size, hidden_size=args.hidden_size).to(device) # 1(?), 64, CUDA
     criterion = nn.MSELoss()
     optimizer = optim.Adam(model.parameters(), lr=args.learning_rate)
 
@@ -540,6 +545,8 @@ def main(args):
 
     for epoch in range(1, args.num_epochs + 1):
         print(f"\nEpoch {epoch}/{args.num_epochs}")
+
+        # PARTE IMPORTANTE
 
         # Training step
         train_loss = run_train_epoch(
