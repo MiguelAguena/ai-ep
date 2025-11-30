@@ -237,8 +237,24 @@ class ARModel(nn.Module):
         self.decoder = nn.GRU(1, hidden_size, batch_first=True)
         self.linear = nn.Linear(hidden_size, input_size)
 
-    def encode(self, x: torch.Tensor, x_lengths: torch.Tensor):
+    def encode(self, x: torch.Tensor, x_timestamps: torch.Tensor, x_lengths: torch.Tensor):
         """Encodes the input sequence."""
+
+        x_timestamps_flatten = torch.flatten(x_timestamps).to(x_timestamps.device)
+
+        x_pe = torch.empty_like(x_timestamps_flatten).to(x_timestamps.device)
+
+        d = len(x_timestamps_flatten)
+
+        idx = torch.arange(len(x_timestamps_flatten)).to(x_timestamps.device)
+        even_idx = idx[::2]
+        odd_idx = idx[1::2]
+
+        x_pe_even = torch.sin(x_timestamps_flatten[::2] / torch.pow(10000, 2 * even_idx / d))
+        x_pe_odd = torch.cos(x_timestamps_flatten[1::2] / torch.pow(10000, 2 * odd_idx / d))
+
+        x_pe[::2] = x_pe_even
+        x_pe[1::2] = x_pe_odd
 
         x_packed = nn.utils.rnn.pack_padded_sequence(
             x, x_lengths.cpu(), batch_first=True, enforce_sorted=False
@@ -263,9 +279,9 @@ class ARModel(nn.Module):
 
         return y_hat
 
-    def forward(self, x, x_lengths, y_lengths):
+    def forward(self, x, x_timestamps, x_lengths, y_lengths):
         """Forward pass: encode the past, decode the future."""
-        h_n = self.encode(x, x_lengths)
+        h_n = self.encode(x, x_timestamps, x_lengths)
         output_seq = self.decode(h_n=h_n, y_lengths=y_lengths)
         return output_seq
 
@@ -295,14 +311,16 @@ def run_train_epoch(
         target_lengths,
     ) in progress_bar:
         inputs = input_features.to(device)
+        inputs_timestamps = input_timestamps.to(device) # Nomes horríveis, eu sei
         targets = target_features.to(device)
+        targets_timestamps = target_timestamps.to(device) # Necessário?
         target_seq_len = targets.shape[1]  # Get future length from target shape
 
         optimizer.zero_grad()
 
         targets = targets[:, : max(target_lengths)]
 
-        outputs = model(inputs, input_lengths, target_lengths)  # FORWARD PASS
+        outputs = model(inputs, inputs_timestamps, input_lengths, target_lengths)  # FORWARD PASS
 
         loss = criterion(outputs, targets)
 
