@@ -44,6 +44,55 @@ torch.manual_seed(SEED)
 np.random.seed(SEED)
 random.seed(SEED)
 
+class TimeEncoding(nn.Module):
+    def __init__(self, d_model: int):
+        super().__init__()
+        self.d_model = d_model
+
+    def forward(self, timestamps: torch.Tensor):
+        """
+        timestamps: (batch, seq_len, 1) float minutes or seconds
+        output: (batch, seq_len, d_model) sinusoidal encodings
+        """
+        timestamps_flatten = torch.flatten(timestamps).to(timestamps.device)
+
+        pe = torch.empty_like(timestamps_flatten).to(timestamps.device)
+
+        d = len(timestamps_flatten)
+
+        idx = torch.arange(len(timestamps_flatten)).to(timestamps.device)
+        even_idx = idx[::2]
+        odd_idx = idx[1::2]
+
+        pe_even = torch.sin(timestamps_flatten[::2] / torch.pow(10000, 2 * even_idx / d))
+        pe_odd = torch.cos(timestamps_flatten[1::2] / torch.pow(10000, 2 * odd_idx / d))
+
+        pe[::2] = pe_even
+        pe[1::2] = pe_odd
+
+        pe_reshaped = pe.reshape(timestamps.shape)
+
+        # (batch, seq_len)
+        t = timestamps.squeeze(-1)
+
+        # frequencies
+        div_terms = torch.exp(
+            torch.arange(0, self.d_model, 2, device=t.device) *
+            (-np.log(10000.0) / self.d_model)
+        )
+
+        # shape broadcasting to (batch, seq_len, d_model/2)
+        sinusoid_inp = t.unsqueeze(-1) * div_terms
+
+        # interleave sin and cos
+        sin = torch.sin(sinusoid_inp)
+        cos = torch.cos(sinusoid_inp)
+
+        # concatenate sin and cos along last dim
+        encoding = torch.stack([sin, cos], dim=-1).flatten(-2)
+        #return encoding
+
+        return pe_reshaped
 
 def load_data(file_path: pathlib.Path) -> pl.DataFrame:
     """Loads data from CSV, and sets datetime and feature types.
@@ -227,13 +276,17 @@ def prepare_dataloaders(
 
 
 class ARModel(nn.Module):
-    """Autoregressive RNN Model using GRU."""
-
     def __init__(self, input_size: int, hidden_size: int):
         super().__init__()
-        self.input_size = input_size
-        self.hidden_size = hidden_size
-        self.encoder = nn.GRU(input_size, hidden_size, batch_first=True)
+
+        self.time_enc = TimeEncoding(hidden_size)
+
+        self.encoder = nn.GRU(
+            2,
+            hidden_size,
+            batch_first=True
+        )
+
         self.decoder = nn.GRU(1, hidden_size, batch_first=True)
         self.linear = nn.Linear(hidden_size, input_size)
 
@@ -263,11 +316,21 @@ class ARModel(nn.Module):
 
         return y_hat
 
-    def forward(self, x, x_lengths, y_lengths):
-        """Forward pass: encode the past, decode the future."""
-        h_n = self.encode(x, x_lengths)
+    def forward(self, x, x_timestamps, x_lengths, y_lengths):
+        # compute time encodings
+        # requires timestamps shape: (batch, seq_len, 1)
+        tenc = self.time_enc(x_timestamps)
+
+        # concatenate features + time encodings
+        x_cat = torch.cat([x, tenc], dim=-1)
+
+        # pass to encoder
+        h_n = self.encode(x_cat, x_lengths)
+
+        # decode
         output_seq = self.decode(h_n=h_n, y_lengths=y_lengths)
         return output_seq
+
 
 
 # --- Training and Evaluation ---
@@ -302,7 +365,7 @@ def run_train_epoch(
 
         targets = targets[:, : max(target_lengths)]
 
-        outputs = model(inputs, input_lengths, target_lengths)  # FORWARD PASS
+        outputs = model(inputs, input_timestamps.to(device), input_lengths, target_lengths)
 
         loss = criterion(outputs, targets)
 
@@ -342,9 +405,10 @@ def run_eval_epoch(
     ) in progress_bar:
         with torch.no_grad():
             inputs = input_features.to(device)
+            inputs_timestamps = input_timestamps.to(device)
             targets = target_features.to(device)
             targets = targets[:, : max(target_lengths)]
-            predictions = model(inputs, input_lengths, target_lengths)  # FORWARD PASS
+            predictions = model(inputs, inputs_timestamps, input_lengths, target_lengths)  # FORWARD PASS
             loss = criterion(predictions, targets)
             total_loss += loss.item()
             num_batches += 1
