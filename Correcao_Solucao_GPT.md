@@ -1,3 +1,5 @@
+Modelo **Claude**
+
 Analisando o gráfico de treinamento, identifico um problema clássico de **overfitting severo**. Veja os sinais:
 
 ## Problemas Identificados
