@@ -144,7 +144,7 @@ for epoch in range(1, args.num_epochs + 1):
 
 Teste essas correções e o modelo deve generalizar muito melhor!
 
-** Modelo ChatGPT **
+**Modelo ChatGPT**
 
 A curva deixa bem claro: **o treinamento continua melhorando enquanto o teste piora fortemente** → *overfitting clássico e severo*.
 Seu modelo tem vários pontos que favorecem o overfitting, especialmente:
