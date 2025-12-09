@@ -1,5 +1,8 @@
 # PCS3838 - Inteligência Artificial - 2025
-# Author: Marcel Rodrigues de Barros
+# Autores:
+#LUCAS PAIVA DA COSTA - NUSP: 10335465
+#MIGUEL SHINITI AGUENA - NUSP: 1255230
+
 # EP - Redes Neurais
 
 # Objetivo: Implementar o mecanismo de codificação temporal utilizando a formulação de codificação posicional
@@ -32,7 +35,7 @@ DEFAULT_FUTURE_LEN = 10 * 200
 DEFAULT_SLIDING_WINDOW_STEP = 50
 DEFAULT_BATCH_SIZE = 32
 DEFAULT_HIDDEN_SIZE = 64
-DEFAULT_NUM_EPOCHS = 1000
+DEFAULT_NUM_EPOCHS = 300
 DEFAULT_LEARNING_RATE = 1e-4
 DEFAULT_DATA_FILENAME = "santos_ssh.csv"
 DEFAULT_TRAIN_TEST_SPLIT_DATE = "2020-06-01 00:00:00"
@@ -45,54 +48,31 @@ np.random.seed(SEED)
 random.seed(SEED)
 
 class TimeEncoding(nn.Module):
-    def __init__(self, d_model: int):
+    def __init__(self, d_model):
         super().__init__()
         self.d_model = d_model
 
-    def forward(self, timestamps: torch.Tensor):
-        """
-        timestamps: (batch, seq_len, 1) float minutes or seconds
-        output: (batch, seq_len, d_model) sinusoidal encodings
-        """
-        timestamps_flatten = torch.flatten(timestamps).to(timestamps.device)
+    def forward(self, timestamps):
 
-        pe = torch.empty_like(timestamps_flatten).to(timestamps.device)
+        pos = timestamps.squeeze(-1)
 
-        d = len(timestamps_flatten)
+        pos0 = pos[:, :1]
+        pos_rel = pos - pos0
+        pos_scaled = pos_rel / 1440.0
 
-        idx = torch.arange(len(timestamps_flatten)).to(timestamps.device)
-        even_idx = idx[::2]
-        odd_idx = idx[1::2]
+        pos = pos_scaled
 
-        pe_even = torch.sin(timestamps_flatten[::2] / torch.pow(10000, 2 * even_idx / d))
-        pe_odd = torch.cos(timestamps_flatten[1::2] / torch.pow(10000, 2 * odd_idx / d))
+        pe = torch.zeros(pos.shape[0], pos.shape[1], self.d_model, device=pos.device)
 
-        pe[::2] = pe_even
-        pe[1::2] = pe_odd
-
-        pe_reshaped = pe.reshape(timestamps.shape)
-
-        # (batch, seq_len)
-        t = timestamps.squeeze(-1)
-
-        # frequencies
-        div_terms = torch.exp(
-            torch.arange(0, self.d_model, 2, device=t.device) *
-            (-np.log(10000.0) / self.d_model)
+        div_term = torch.exp(
+            torch.arange(0, self.d_model, 2, device=pos.device)
+            * (-np.log(10000.0) / self.d_model)
         )
 
-        # shape broadcasting to (batch, seq_len, d_model/2)
-        sinusoid_inp = t.unsqueeze(-1) * div_terms
+        pe[:, :, 0::2] = torch.sin(pos.unsqueeze(-1) * div_term)
+        pe[:, :, 1::2] = torch.cos(pos.unsqueeze(-1) * div_term)
 
-        # interleave sin and cos
-        sin = torch.sin(sinusoid_inp)
-        cos = torch.cos(sinusoid_inp)
-
-        # concatenate sin and cos along last dim
-        encoding = torch.stack([sin, cos], dim=-1).flatten(-2)
-        #return encoding
-
-        return pe_reshaped
+        return pe
 
 def load_data(file_path: pathlib.Path) -> pl.DataFrame:
     """Loads data from CSV, and sets datetime and feature types.
@@ -281,13 +261,8 @@ class ARModel(nn.Module):
 
         self.time_enc = TimeEncoding(hidden_size)
 
-        self.encoder = nn.GRU(
-            2,
-            hidden_size,
-            batch_first=True
-        )
-
-        self.decoder = nn.GRU(1, hidden_size, batch_first=True)
+        self.encoder = nn.GRU(input_size + hidden_size, hidden_size, batch_first=True)
+        self.decoder = nn.GRU(1 + hidden_size, hidden_size, batch_first=True)
         self.linear = nn.Linear(hidden_size, input_size)
 
     def encode(self, x: torch.Tensor, x_lengths: torch.Tensor):
@@ -299,36 +274,41 @@ class ARModel(nn.Module):
         _, h_n = self.encoder(x_packed)  # h_n shape: (1, batch_size, hidden_size)
         return h_n
 
-    def decode(self, h_n: torch.Tensor, y_lengths: torch.Tensor):
-        """Decodes the sequence autoregressively."""
+    def decode(self, h_n, target_timestamps, y_lengths):
         batch_size = h_n.size(1)
+        max_len = y_lengths.max().item()
 
-        mock_input = torch.zeros(batch_size, y_lengths.max(), 1, device=h_n.device)
-        mock_packed = nn.utils.rnn.pack_padded_sequence(
-            mock_input, y_lengths.cpu(), batch_first=True, enforce_sorted=False
+        mock_input = torch.zeros(batch_size, max_len, 1, device=h_n.device)
+
+        tenc_future = self.time_enc(target_timestamps)   # (batch, seq_total, d_model)
+
+        tenc_future = tenc_future[:, :max_len, :]
+
+        decoder_input = torch.cat([mock_input, tenc_future], dim=-1)
+
+        decoder_packed = nn.utils.rnn.pack_padded_sequence(
+            decoder_input,
+            y_lengths.cpu(),
+            batch_first=True,
+            enforce_sorted=False
         )
 
-        out, _ = self.decoder(mock_packed, h_n)
-
+        out, _ = self.decoder(decoder_packed, h_n)
         out = nn.utils.rnn.pad_packed_sequence(out, batch_first=True)[0]
 
-        y_hat = self.linear(out)
+        return self.linear(out)
 
-        return y_hat
-
-    def forward(self, x, x_timestamps, x_lengths, y_lengths):
-        # compute time encodings
-        # requires timestamps shape: (batch, seq_len, 1)
+    def forward(self, x, x_timestamps, x_lengths, y_timestamps, y_lengths):
         tenc = self.time_enc(x_timestamps)
-
-        # concatenate features + time encodings
         x_cat = torch.cat([x, tenc], dim=-1)
-
-        # pass to encoder
         h_n = self.encode(x_cat, x_lengths)
 
-        # decode
-        output_seq = self.decode(h_n=h_n, y_lengths=y_lengths)
+        output_seq = self.decode(
+            h_n=h_n,
+            target_timestamps=y_timestamps,
+            y_lengths=y_lengths
+        )
+
         return output_seq
 
 
@@ -365,7 +345,7 @@ def run_train_epoch(
 
         targets = targets[:, : max(target_lengths)]
 
-        outputs = model(inputs, input_timestamps.to(device), input_lengths, target_lengths)
+        outputs = model(inputs, input_timestamps.to(device), input_lengths, target_timestamps.to(device), target_lengths)
 
         loss = criterion(outputs, targets)
 
@@ -405,10 +385,9 @@ def run_eval_epoch(
     ) in progress_bar:
         with torch.no_grad():
             inputs = input_features.to(device)
-            inputs_timestamps = input_timestamps.to(device)
             targets = target_features.to(device)
             targets = targets[:, : max(target_lengths)]
-            predictions = model(inputs, inputs_timestamps, input_lengths, target_lengths)  # FORWARD PASS
+            predictions = model(inputs, input_timestamps.to(device), input_lengths, target_timestamps.to(device), target_lengths)  # FORWARD PASS
             loss = criterion(predictions, targets)
             total_loss += loss.item()
             num_batches += 1
