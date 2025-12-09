@@ -37,13 +37,62 @@ DEFAULT_LEARNING_RATE = 1e-4
 DEFAULT_DATA_FILENAME = "santos_ssh.csv"
 DEFAULT_TRAIN_TEST_SPLIT_DATE = "2020-06-01 00:00:00"
 DEFAULT_PAST_PLOT_VIEW_SIZE = 200
-DATA_REMOVAL_RATIO = 0.0
+DATA_REMOVAL_RATIO = 0.4
 
 SEED = 100
 torch.manual_seed(SEED)
 np.random.seed(SEED)
 random.seed(SEED)
 
+class TimeEncoding(nn.Module):
+    def __init__(self, d_model: int):
+        super().__init__()
+        self.d_model = d_model
+
+    def forward(self, timestamps: torch.Tensor):
+        """
+        timestamps: (batch, seq_len, 1) float minutes or seconds
+        output: (batch, seq_len, d_model) sinusoidal encodings
+        """
+        timestamps_flatten = torch.flatten(timestamps).to(timestamps.device)
+
+        pe = torch.empty_like(timestamps_flatten).to(timestamps.device)
+
+        d = len(timestamps_flatten)
+
+        idx = torch.arange(len(timestamps_flatten)).to(timestamps.device)
+        even_idx = idx[::2]
+        odd_idx = idx[1::2]
+
+        pe_even = torch.sin(timestamps_flatten[::2] / torch.pow(10000, 2 * even_idx / d))
+        pe_odd = torch.cos(timestamps_flatten[1::2] / torch.pow(10000, 2 * odd_idx / d))
+
+        pe[::2] = pe_even
+        pe[1::2] = pe_odd
+
+        pe_reshaped = pe.reshape(timestamps.shape)
+
+        # (batch, seq_len)
+        t = timestamps.squeeze(-1)
+
+        # frequencies
+        div_terms = torch.exp(
+            torch.arange(0, self.d_model, 2, device=t.device) *
+            (-np.log(10000.0) / self.d_model)
+        )
+
+        # shape broadcasting to (batch, seq_len, d_model/2)
+        sinusoid_inp = t.unsqueeze(-1) * div_terms
+
+        # interleave sin and cos
+        sin = torch.sin(sinusoid_inp)
+        cos = torch.cos(sinusoid_inp)
+
+        # concatenate sin and cos along last dim
+        encoding = torch.stack([sin, cos], dim=-1).flatten(-2)
+        #return encoding
+
+        return pe_reshaped
 
 def load_data(file_path: pathlib.Path) -> pl.DataFrame:
     """Loads data from CSV, and sets datetime and feature types.
@@ -227,34 +276,22 @@ def prepare_dataloaders(
 
 
 class ARModel(nn.Module):
-    """Autoregressive RNN Model using GRU."""
-
     def __init__(self, input_size: int, hidden_size: int):
         super().__init__()
-        self.input_size = input_size
-        self.hidden_size = hidden_size
-        self.encoder = nn.GRU(input_size, hidden_size, batch_first=True)
+
+        self.time_enc = TimeEncoding(hidden_size)
+
+        self.encoder = nn.GRU(
+            2,
+            hidden_size,
+            batch_first=True
+        )
+
         self.decoder = nn.GRU(1, hidden_size, batch_first=True)
         self.linear = nn.Linear(hidden_size, input_size)
 
-    def encode(self, x: torch.Tensor, x_timestamps: torch.Tensor, x_lengths: torch.Tensor):
+    def encode(self, x: torch.Tensor, x_lengths: torch.Tensor):
         """Encodes the input sequence."""
-
-        x_timestamps_flatten = torch.flatten(x_timestamps).to(x_timestamps.device)
-
-        x_pe = torch.empty_like(x_timestamps_flatten).to(x_timestamps.device)
-
-        d = len(x_timestamps_flatten)
-
-        idx = torch.arange(len(x_timestamps_flatten)).to(x_timestamps.device)
-        even_idx = idx[::2]
-        odd_idx = idx[1::2]
-
-        x_pe_even = torch.sin(x_timestamps_flatten[::2] / torch.pow(10000, 2 * even_idx / d))
-        x_pe_odd = torch.cos(x_timestamps_flatten[1::2] / torch.pow(10000, 2 * odd_idx / d))
-
-        x_pe[::2] = x_pe_even
-        x_pe[1::2] = x_pe_odd
 
         x_packed = nn.utils.rnn.pack_padded_sequence(
             x, x_lengths.cpu(), batch_first=True, enforce_sorted=False
@@ -280,10 +317,20 @@ class ARModel(nn.Module):
         return y_hat
 
     def forward(self, x, x_timestamps, x_lengths, y_lengths):
-        """Forward pass: encode the past, decode the future."""
-        h_n = self.encode(x, x_timestamps, x_lengths)
+        # compute time encodings
+        # requires timestamps shape: (batch, seq_len, 1)
+        tenc = self.time_enc(x_timestamps)
+
+        # concatenate features + time encodings
+        x_cat = torch.cat([x, tenc], dim=-1)
+
+        # pass to encoder
+        h_n = self.encode(x_cat, x_lengths)
+
+        # decode
         output_seq = self.decode(h_n=h_n, y_lengths=y_lengths)
         return output_seq
+
 
 
 # --- Training and Evaluation ---
@@ -311,16 +358,14 @@ def run_train_epoch(
         target_lengths,
     ) in progress_bar:
         inputs = input_features.to(device)
-        inputs_timestamps = input_timestamps.to(device) # Nomes horríveis, eu sei
         targets = target_features.to(device)
-        targets_timestamps = target_timestamps.to(device) # Necessário?
         target_seq_len = targets.shape[1]  # Get future length from target shape
 
         optimizer.zero_grad()
 
         targets = targets[:, : max(target_lengths)]
 
-        outputs = model(inputs, inputs_timestamps, input_lengths, target_lengths)  # FORWARD PASS
+        outputs = model(inputs, input_timestamps.to(device), input_lengths, target_lengths)
 
         loss = criterion(outputs, targets)
 
@@ -360,9 +405,10 @@ def run_eval_epoch(
     ) in progress_bar:
         with torch.no_grad():
             inputs = input_features.to(device)
+            inputs_timestamps = input_timestamps.to(device)
             targets = target_features.to(device)
             targets = targets[:, : max(target_lengths)]
-            predictions = model(inputs, input_lengths, target_lengths)  # FORWARD PASS
+            predictions = model(inputs, inputs_timestamps, input_lengths, target_lengths)  # FORWARD PASS
             loss = criterion(predictions, targets)
             total_loss += loss.item()
             num_batches += 1
@@ -474,11 +520,11 @@ def main(args):
 
     # --- Data Preparation ---
     file_path = pathlib.Path(args.data_filename)
-    split_date = datetime.datetime.fromisoformat(args.split_date) # Divide df de treinamento e df de teste a partir do dia 01/06/2020 (para o df de teste, é inclusivo)
+    split_date = datetime.datetime.fromisoformat(args.split_date)
     df = load_data(file_path=file_path)
-    feature_names = list(df.drop("datetime").columns) # Parece que só inclui o ssh...
+    feature_names = list(df.drop("datetime").columns)
 
-    train_df, test_df = split_data(df=df, split_date=split_date) #
+    train_df, test_df = split_data(df=df, split_date=split_date)
 
     # --- Apply scaling ---
     # Calculate mean and std from training data only
@@ -493,13 +539,13 @@ def main(args):
             (pl.col(f) - train_mean.select([f]).item()) / train_std.select([f]).item()
             for f in feature_names
         ]
-    ) # Normalização
+    )
     test_data_scaled = test_df.with_columns(
         [
             (pl.col(f) - train_mean.select([f]).item()) / train_std.select([f]).item()
             for f in feature_names
         ]
-    ) # Normalização
+    )
 
     # convert datetimes to minutes since first measurement
     train_data_scaled = train_data_scaled.with_columns(
@@ -509,8 +555,7 @@ def main(args):
             .cast(pl.Float32)
             .alias("datetime")
         ]
-    ) # Transformando em minutos
-
+    )
     test_data_scaled = test_data_scaled.with_columns(
         [
             (pl.col("datetime") - pl.col("datetime").min())
@@ -518,7 +563,7 @@ def main(args):
             .cast(pl.Float32)
             .alias("datetime")
         ]
-    ) # Transformando em minutos
+    )
 
     # Data removal to simulate missing data
     sample_train = sorted(
@@ -526,9 +571,7 @@ def main(args):
             range(train_data_scaled.height),
             int((1 - DATA_REMOVAL_RATIO) * train_data_scaled.height),
         )
-    ) # Remover parte dos dados de treinamento
-    # ALTERAR DATA_REMOVAL_RATIO DEPOIS
-
+    )
     train_data_scaled = train_data_scaled[sample_train]
 
     sample_test = sorted(
@@ -536,9 +579,7 @@ def main(args):
             range(test_data_scaled.height),
             int((1 - DATA_REMOVAL_RATIO) * test_data_scaled.height),
         )
-    ) # Remover parte dos dados de teste
-    # ALTERAR DATA_REMOVAL_RATIO DEPOIS
-
+    )
     test_data_scaled = test_data_scaled[sample_test]
 
     train_dataloader, test_dataloader = prepare_dataloaders(
@@ -551,8 +592,8 @@ def main(args):
     )
 
     # --- Model Setup ---
-    input_size = len(feature_names) # 1(?)
-    model = ARModel(input_size=input_size, hidden_size=args.hidden_size).to(device) # 1(?), 64, CUDA
+    input_size = len(feature_names)
+    model = ARModel(input_size=input_size, hidden_size=args.hidden_size).to(device)
     criterion = nn.MSELoss()
     optimizer = optim.Adam(model.parameters(), lr=args.learning_rate)
 
@@ -563,8 +604,6 @@ def main(args):
 
     for epoch in range(1, args.num_epochs + 1):
         print(f"\nEpoch {epoch}/{args.num_epochs}")
-
-        # PARTE IMPORTANTE
 
         # Training step
         train_loss = run_train_epoch(
